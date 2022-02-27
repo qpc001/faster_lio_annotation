@@ -23,6 +23,7 @@ void PointCloudPreprocess::Process(const sensor_msgs::PointCloud2::ConstPtr &msg
             break;
 
         case LidarType::VELO32:
+            // 检查点云的点是否有时间属性，没有则计算相对时间，然后进行简单点云滤除
             VelodyneHandler(msg);
             break;
 
@@ -30,6 +31,7 @@ void PointCloudPreprocess::Process(const sensor_msgs::PointCloud2::ConstPtr &msg
             LOG(ERROR) << "Error LiDAR Type";
             break;
     }
+    // 预处理后的点云输出
     *pcl_out = cloud_out_;
 }
 
@@ -109,6 +111,10 @@ void PointCloudPreprocess::Oust64Handler(const sensor_msgs::PointCloud2::ConstPt
     }
 }
 
+/**
+ * @brief 检查点云的点是否有时间属性，没有则计算相对时间，然后进行简单点云滤除
+ * @param msg
+ */
 void PointCloudPreprocess::VelodyneHandler(const sensor_msgs::PointCloud2::ConstPtr &msg) {
     cloud_out_.clear();
     cloud_full_.clear();
@@ -119,6 +125,7 @@ void PointCloudPreprocess::VelodyneHandler(const sensor_msgs::PointCloud2::Const
     cloud_out_.reserve(plsize);
 
     /*** These variables only works when no point timestamps given ***/
+    /**  下面的参数只有在点云中的每个点没有时间属性的时候才会用到             **/
     double omega_l = 3.61;  // scan angular velocity
     std::vector<bool> is_first(num_scans_, true);
     std::vector<double> yaw_fp(num_scans_, 0.0);    // yaw of first scan point
@@ -126,14 +133,20 @@ void PointCloudPreprocess::VelodyneHandler(const sensor_msgs::PointCloud2::Const
     std::vector<float> time_last(num_scans_, 0.0);  // last offset time
     /*****************************************************************/
 
+    // 检查点云的点是否有时间属性
     if (pl_orig.points[plsize - 1].time > 0) {
         given_offset_time_ = true;
     } else {
+        // 如果没有时间属性，那么这里会计算扫描一圈的起始、结束角度
         given_offset_time_ = false;
+        // 计算第0个点的yaw角（度）
         double yaw_first = atan2(pl_orig.points[0].y, pl_orig.points[0].x) * 57.29578;
         double yaw_end = yaw_first;
+        // 取第0个点的ring号
         int layer_first = pl_orig.points[0].ring;
+        // 从最后一个点向前遍历
         for (uint i = plsize - 1; i > 0; i--) {
+            // 如果与第0个点是同一线束，就计算yaw_end
             if (pl_orig.points[i].ring == layer_first) {
                 yaw_end = atan2(pl_orig.points[i].y, pl_orig.points[i].x) * 57.29578;
                 break;
@@ -141,6 +154,7 @@ void PointCloudPreprocess::VelodyneHandler(const sensor_msgs::PointCloud2::Const
         }
     }
 
+    // 遍历每一个点
     for (int i = 0; i < plsize; i++) {
         PointType added_pt;
 
@@ -151,34 +165,43 @@ void PointCloudPreprocess::VelodyneHandler(const sensor_msgs::PointCloud2::Const
         added_pt.y = pl_orig.points[i].y;
         added_pt.z = pl_orig.points[i].z;
         added_pt.intensity = pl_orig.points[i].intensity;
-        added_pt.curvature = pl_orig.points[i].time * time_scale_;  // curvature unit: ms
+        added_pt.curvature = pl_orig.points[i].time * time_scale_;  // curvature unit: ms   使用curvature储存该点时间
 
+        // 如果点云的点没有时间属性，下面则计算时间
         if (!given_offset_time_) {
+            // 取线束号为layer
             int layer = pl_orig.points[i].ring;
+            // 计算该点角度
             double yaw_angle = atan2(added_pt.y, added_pt.x) * 57.2957;
 
+            // 如果是某条线束的第0个点
             if (is_first[layer]) {
-                yaw_fp[layer] = yaw_angle;
-                is_first[layer] = false;
-                added_pt.curvature = 0.0;
+                yaw_fp[layer] = yaw_angle;  // 设置起始角度
+                is_first[layer] = false;    // 标记，第0个点
+                added_pt.curvature = 0.0;   // 第0个点的时间偏移为0
                 yaw_last[layer] = yaw_angle;
                 time_last[layer] = added_pt.curvature;
                 continue;
             }
 
             // compute offset time
-            if (yaw_angle <= yaw_fp[layer]) {
-                added_pt.curvature = (yaw_fp[layer] - yaw_angle) / omega_l;
+            // curvature: 相对时间，以秒为单位
+            if (yaw_angle <= yaw_fp[layer]) {   // 如果当前这个点的角度 > 该线束起始点的角度
+                added_pt.curvature = (yaw_fp[layer] - yaw_angle) / omega_l; // 计算相对时间， 这里除以3.61, 是因为10Hz雷达，1s转过3600度，
             } else {
                 added_pt.curvature = (yaw_fp[layer] - yaw_angle + 360.0) / omega_l;
             }
 
+            // 如果当前这个点的相对时间 < 上一个点的时间，表明已经越过一圈了
             if (added_pt.curvature < time_last[layer]) added_pt.curvature += 360.0 / omega_l;
 
+            // 记录该线束最终扫描结束角度
             yaw_last[layer] = yaw_angle;
+            // 保存时间，作为上一个点的时间
             time_last[layer] = added_pt.curvature;
         }
 
+        // 简单粗暴按间隔滤除一些点，同时滤除距离较近的点
         if (i % point_filter_num_ == 0) {
             if (added_pt.x * added_pt.x + added_pt.y * added_pt.y + added_pt.z * added_pt.z > (blind_ * blind_)) {
                 cloud_out_.points.push_back(added_pt);

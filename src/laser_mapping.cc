@@ -17,6 +17,12 @@ bool LaserMapping::InitROS(ros::NodeHandle &nh) {
 
     // esekf init
     std::vector<double> epsi(23, 0.001);
+    // 初始化，传入几个函数
+    // 1. get_f: 用于根据IMU数据向前推算
+    // 2. df_dx: 误差状态模型，（连续时间下）
+    // 3. df_dw: 误差状态模型，误差状态对过程噪声求导
+    // 4. lambda: 函数类型 std::function<void(state &, dyn_share_datastruct<scalar_type> &)>
+    //
     kf_.init_dyn_share(
         get_f, df_dx, df_dw,
         [this](state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_data) { ObsModel(s, ekfom_data); },
@@ -50,6 +56,11 @@ bool LaserMapping::InitWithoutROS(const std::string &config_yaml) {
     return true;
 }
 
+/**
+ * @brief 读取配置文件，初始化IMUProcessor
+ * @param nh
+ * @return
+ */
 bool LaserMapping::LoadParams(ros::NodeHandle &nh) {
     // get params from param server
     int lidar_type, ivox_nearby_type;
@@ -267,26 +278,33 @@ void LaserMapping::Run() {
     }
 
     /// IMU process, kf prediction, undistortion
+    // IMU数据初始化，初始化完成后进入去畸变函数
+    // 去畸变函数中，利用IMU数据对kf_状态进行前向传播，同时对点云进行去畸变，得到scan_undistort_
     p_imu_->Process(measures_, kf_, scan_undistort_);
+    // 如果是初始化阶段，在p_imu_->Process时没有进行点云去畸变，只是设置了kf_的初始状态就return了
+    // 所以，到了这里会return
     if (scan_undistort_->empty() || (scan_undistort_ == nullptr)) {
         LOG(WARNING) << "No point, skip this scan!";
         return;
     }
 
     /// the first scan
+    /// 如果是第一帧激光，那么还需要直接返回一次
     if (flg_first_scan_) {
         ivox_->AddPoints(scan_undistort_->points);
+        // 记录第一帧激光数据时间戳
         first_lidar_time_ = measures_.lidar_bag_time_;
         flg_first_scan_ = false;
         return;
     }
+    // 再一次，才会到达这里，此时，按道理来说， flg_EKF_inited_是满足条件的， 为true
     flg_EKF_inited_ = (measures_.lidar_bag_time_ - first_lidar_time_) >= options::INIT_TIME;
 
     /// downsample
     Timer::Evaluate(
         [&, this]() {
             voxel_scan_.setInputCloud(scan_undistort_);
-            voxel_scan_.filter(*scan_down_body_);
+            voxel_scan_.filter(*scan_down_body_);   // 虽然这里命名为scan_down_body_，但是这个时候的点云还是在激光雷达坐标系的，后面在LaserMapping::ObsModel函数中才转换到body系
         },
         "Downsample PointCloud");
 
@@ -296,6 +314,7 @@ void LaserMapping::Run() {
         return;
     }
     scan_down_world_->resize(cur_pts);
+    // 在LaserMapping::ObsModel通过下标访问，所以这里先resize
     nearest_points_.resize(cur_pts);
 
     // ICP and iterated Kalman filter update
@@ -304,6 +323,7 @@ void LaserMapping::Run() {
             // iterated state estimation
             double solve_H_time = 0;
             // update the observation model, will call nn and point-to-plane residual computation
+            // 这里内部会执行LaserMapping::ObsModel函数，因为在初始化的时候通过lambda传进kf_了
             kf_.update_iterated_dyn_share_modified(options::LASER_POINT_COV, solve_H_time);
             // save the state
             state_point_ = kf_.get_x();
@@ -352,6 +372,7 @@ void LaserMapping::StandardPCLCallBack(const sensor_msgs::PointCloud2::ConstPtr 
     mtx_buffer_.lock();
     Timer::Evaluate(
         [&, this]() {
+            // 激光扫描计数
             scan_count_++;
             if (msg->header.stamp.toSec() < last_timestamp_lidar_) {
                 LOG(ERROR) << "lidar loop back, clear buffer";
@@ -359,9 +380,13 @@ void LaserMapping::StandardPCLCallBack(const sensor_msgs::PointCloud2::ConstPtr 
             }
 
             PointCloudType::Ptr ptr(new PointCloudType());
+            // 检查点云的点是否有时间属性，没有则计算相对时间，然后进行简单点云滤除
             preprocess_->Process(msg, ptr);
+            // 保存预处理后的点云
             lidar_buffer_.push_back(ptr);
+            // 保存激光点云时间戳
             time_buffer_.push_back(msg->header.stamp.toSec());
+            // 记录最新点云时间戳
             last_timestamp_lidar_ = msg->header.stamp.toSec();
         },
         "Preprocess (Standard)");
@@ -407,6 +432,7 @@ void LaserMapping::IMUCallBack(const sensor_msgs::Imu::ConstPtr &msg_in) {
     publish_count_++;
     sensor_msgs::Imu::Ptr msg(new sensor_msgs::Imu(*msg_in));
 
+    // 时间补偿，Livox雷达用到
     if (abs(timediff_lidar_wrt_imu_) > 0.1 && time_sync_en_) {
         msg->header.stamp = ros::Time().fromSec(timediff_lidar_wrt_imu_ + msg_in->header.stamp.toSec());
     }
@@ -419,7 +445,9 @@ void LaserMapping::IMUCallBack(const sensor_msgs::Imu::ConstPtr &msg_in) {
         imu_buffer_.clear();
     }
 
+    // 保存最新imu时间
     last_timestamp_imu_ = timestamp;
+    // 保存imu数据
     imu_buffer_.emplace_back(msg);
     mtx_buffer_.unlock();
 }
@@ -431,9 +459,11 @@ bool LaserMapping::SyncPackages() {
 
     /*** push a lidar scan ***/
     if (!lidar_pushed_) {
+        // 取最旧的雷达数据和 扫描起始时间
         measures_.lidar_ = lidar_buffer_.front();
         measures_.lidar_bag_time_ = time_buffer_.front();
 
+        // 计算扫描结束时间lidar_end_time_
         if (measures_.lidar_->points.size() <= 1) {
             LOG(WARNING) << "Too few input point cloud!";
             lidar_end_time_ = measures_.lidar_bag_time_ + lidar_mean_scantime_;
@@ -450,20 +480,25 @@ bool LaserMapping::SyncPackages() {
         lidar_pushed_ = true;
     }
 
+    // 如果最新的imu时间戳 < 激光扫描结束时刻的时间戳，无法插值和去畸变，直接return
     if (last_timestamp_imu_ < lidar_end_time_) {
         return false;
     }
 
     /*** push imu_ data, and pop from imu_ buffer ***/
+    // 取最旧imu时间戳
     double imu_time = imu_buffer_.front()->header.stamp.toSec();
     measures_.imu_.clear();
+    // 遍历imu buffer
     while ((!imu_buffer_.empty()) && (imu_time < lidar_end_time_)) {
+        // 保存在激光扫描时刻之前的IMU数据
         imu_time = imu_buffer_.front()->header.stamp.toSec();
         if (imu_time > lidar_end_time_) break;
         measures_.imu_.push_back(imu_buffer_.front());
+        // 清理IMU BUFFER
         imu_buffer_.pop_front();
     }
-
+    // 上面完成之后，可以得到 区间为(上一次取完imu数据, 激光扫描结束时刻之前) 的IMU数据
     lidar_buffer_.pop_front();
     time_buffer_.pop_front();
     lidar_pushed_ = false;
@@ -539,52 +574,69 @@ void LaserMapping::MapIncremental() {
  * Lidar point cloud registration
  * will be called by the eskf custom observation model
  * compute point-to-plane residual here
- * @param s kf state
+ * @param s kf state (这里实际传的是经过IMU前向传播的状态)
  * @param ekfom_data H matrix
  */
 void LaserMapping::ObsModel(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_data) {
+    // 经过去畸变和降采样后的点云点数
     int cnt_pts = scan_down_body_->size();
-
+    // 构造index，[0,1,2...]
     std::vector<size_t> index(cnt_pts);
     for (size_t i = 0; i < index.size(); ++i) {
         index[i] = i;
     }
 
     std::vector<float> residuals(cnt_pts, 0);
-    std::vector<bool> point_selected_surf(cnt_pts, true);   // selected points
+    std::vector<bool> point_selected_surf(cnt_pts, true);   // selected points，储存标志，表明对应idx的点是否能找到5个最近点
     common::VV4F plane_coef(cnt_pts, common::V4F::Zero());  // plane coeffs
 
     Timer::Evaluate(
         [&, this]() {
+            // s.offset_R_L_I: 激光雷达坐标系到IMU坐标系的旋转变换
+            // s.rot: 经过IMU前向传播的姿态，IMU坐标系到世界坐标系的旋转变换
+            // 这里得到了将点从激光雷达坐标系转换到世界坐标系的R_wl和t_wl
             auto R_wl = (s.rot * s.offset_R_L_I).cast<float>();
             auto t_wl = (s.rot * s.offset_T_L_I + s.pos).cast<float>();
 
             /** closest surface search and residual computation **/
             std::for_each(std::execution::par_unseq, index.begin(), index.end(), [&](const size_t &i) {
+                // 取引用
                 PointType &point_body = scan_down_body_->points[i];
+                // scan_down_world_目前内部元素都是刚刚初始化的
                 PointType &point_world = scan_down_world_->points[i];
 
                 /* transform to world frame */
                 common::V3F p_body = point_body.getVector3fMap();
+                // 将点从激光雷达坐标系转换到世界坐标系，并且设置给point_world
                 point_world.getVector3fMap() = R_wl * p_body + t_wl;
+                // 这里的intensity属性是啥?
                 point_world.intensity = point_body.intensity;
 
+                // 取引用，在LaserMapping::Run已经初始化过了，所以是有元素的，并且size与降采样点云点数一样
                 auto &points_near = nearest_points_[i];
+                // ???
                 if (ekfom_data.converge) {
                     /** Find the closest surfaces in the map **/
+                    // 使用ivox_获取地图坐标系中与point_world最近的N个点（N=options::NUM_MATCH_POINTS）
                     ivox_->GetClosestPoint(point_world, points_near, options::NUM_MATCH_POINTS);
+                    // 设置标志位，表明是否找到足够的接近点
                     point_selected_surf[i] = points_near.size() >= options::MIN_NUM_MATCH_POINTS;
                     if (point_selected_surf[i]) {
+                        // 根据平面拟合效果设置标志位
+                        // plane_coef[i]: 得到的平面法向量
                         point_selected_surf[i] =
                             common::esti_plane(plane_coef[i], points_near, options::ESTI_PLANE_THRESHOLD);
                     }
                 }
 
+                // 如果这个点有效
                 if (point_selected_surf[i]) {
+                    // 计算点到平面距离
                     auto temp = point_world.getVector4fMap();
                     temp[3] = 1.0;
                     float pd2 = plane_coef[i].dot(temp);
 
+                    // ???? 也没有else
                     bool valid_corr = p_body.norm() > 81 * pd2 * pd2;
                     if (valid_corr) {
                         point_selected_surf[i] = true;
@@ -597,17 +649,23 @@ void LaserMapping::ObsModel(state_ikfom &s, esekfom::dyn_share_datastruct<double
 
     effect_feat_num_ = 0;
 
+    // cnt_pts: 经过去畸变和降采样后的点云点数
     corr_pts_.resize(cnt_pts);
     corr_norm_.resize(cnt_pts);
     for (int i = 0; i < cnt_pts; i++) {
+        // 如果该点有效
         if (point_selected_surf[i]) {
+            // 保存平面方程
             corr_norm_[effect_feat_num_] = std::move(plane_coef[i]);
+            // 激光雷达坐标系中的点
             corr_pts_[effect_feat_num_] = scan_down_body_->points[i].getVector4fMap();
+            // (激光雷达坐标系的点投影到世界坐标系后)点到平面距离
             corr_pts_[effect_feat_num_][3] = residuals[i];
 
             effect_feat_num_++;
         }
     }
+    // 对上面两个容器进行截取
     corr_pts_.resize(effect_feat_num_);
     corr_norm_.resize(effect_feat_num_);
 
@@ -620,37 +678,56 @@ void LaserMapping::ObsModel(state_ikfom &s, esekfom::dyn_share_datastruct<double
     Timer::Evaluate(
         [&, this]() {
             /*** Computation of Measurement Jacobian matrix H and measurements vector ***/
+            // 初始化H矩阵，行数: 特征点数  列数:
             ekfom_data.h_x = Eigen::MatrixXd::Zero(effect_feat_num_, 12);  // 23
             ekfom_data.h.resize(effect_feat_num_);
 
             index.resize(effect_feat_num_);
+            // 取状态中的外参
             const common::M3F off_R = s.offset_R_L_I.toRotationMatrix().cast<float>();
             const common::V3F off_t = s.offset_T_L_I.cast<float>();
             const common::M3F Rt = s.rot.toRotationMatrix().transpose().cast<float>();
 
+            // 遍历每个有效点
             std::for_each(std::execution::par_unseq, index.begin(), index.end(), [&](const size_t &i) {
+                // 激光雷达坐标系中的点
                 common::V3F point_this_be = corr_pts_[i].head<3>();
                 common::M3F point_be_crossmat = SKEW_SYM_MATRIX(point_this_be);
+                // 激光雷达坐标系中的点转换到IMU坐标系
                 common::V3F point_this = off_R * point_this_be + off_t;
                 common::M3F point_crossmat = SKEW_SYM_MATRIX(point_this);
 
                 /*** get the normal vector of closest surface/corner ***/
+                // 平面法向量
                 common::V3F norm_vec = corr_norm_[i].head<3>();
 
                 /*** calculate the Measurement Jacobian matrix H ***/
+                // 点到平面距离: u^{T}(P_in_world)+d
+                //           = u^{T}( R_{I}^{W}*P_in_I + t_{I}^{w} )+d
+                //           = u^{T}( R_{I}^{W}*point_this + t_{I}^{w} )+d
+                //           = u^{T}( R_{I}^{W}*(R_{L}^{I}*P_in_L + t_{L}^{I}) + t_{I}^{w} )+d
                 common::V3F C(Rt * norm_vec);
+                // A = [Pa]^ * R^{T} * u
+                // A^{T} = -u^{T}*R*[Pa]^
                 common::V3F A(point_crossmat * C);
 
+                // 如果估计外参
                 if (extrinsic_est_en_) {
                     common::V3F B(point_be_crossmat * off_R.transpose() * C);
                     ekfom_data.h_x.block<1, 12>(i, 0) << norm_vec[0], norm_vec[1], norm_vec[2], A[0], A[1], A[2], B[0],
                         B[1], B[2], C[0], C[1], C[2];
                 } else {
+                    // 这是对误差状态求导, 推导过程参见: R2LIVE 论文附录
+                    // 点到平面距离对位置误差状态求导: norm_vec[0], norm_vec[1], norm_vec[2]
+                    // 点到平面距离对姿态误差状态求导: A[0], A[1], A[2]
+                    // 因为要取列向量，但是下标访问的是行向量，所以求导的时候直接求了A
+                    // 实际上，点到平面距离对姿态误差状态求导是A^{T}
                     ekfom_data.h_x.block<1, 12>(i, 0) << norm_vec[0], norm_vec[1], norm_vec[2], A[0], A[1], A[2], 0.0,
                         0.0, 0.0, 0.0, 0.0, 0.0;
                 }
 
                 /*** Measurement: distance to the closest surface/corner ***/
+                // 点到平面距离，提前加上了负号???
                 ekfom_data.h(i) = -corr_pts_[i][3];
             });
         },

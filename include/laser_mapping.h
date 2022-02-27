@@ -117,7 +117,7 @@ class LaserMapping {
     ros::Publisher pub_path_;
 
     std::mutex mtx_buffer_;
-    std::deque<double> time_buffer_;
+    std::deque<double> time_buffer_;    ///< 储存每帧点云的时间戳， rosmsg.header.stamp  ， 所以会认为是点云扫描起始时刻的时间
     std::deque<PointCloudType::Ptr> lidar_buffer_;
     std::deque<sensor_msgs::Imu::ConstPtr> imu_buffer_;
     nav_msgs::Odometry odom_aft_mapped_;
@@ -129,7 +129,7 @@ class LaserMapping {
     double lidar_end_time_ = 0;
     double last_timestamp_imu_ = -1.0;
     double first_lidar_time_ = 0.0;
-    bool lidar_pushed_ = false;
+    bool lidar_pushed_ = false; ///< 用于标记measures_中，激光雷达数据是否已经填入
 
     /// statistics and flags ///
     int scan_count_ = 0;

@@ -45,14 +45,32 @@ Eigen::Matrix<double, 24, 1> get_f(state_ikfom &s, const input_ikfom &in) {
     return res;
 }
 
+//--------------------------------------------------
+// 状态X [p, q, R_^L_I, t_^L_I, vel, bg, ba, gravity]
+//      [0, 3,    6,     9 ,    12, 15, 18,  21]
+// 与论文顺序不同
+//--------------------------------------------------
+
+/**
+ * @brief IKFoM::df_dx
+ * 因为最后一个状态是重力，求导没影响，所以是 24x23的雅可比矩阵
+ * @param s
+ * @param in    1帧IMU数据
+ * @return
+ */
 Eigen::Matrix<double, 24, 23> df_dx(state_ikfom &s, const input_ikfom &in) {
     Eigen::Matrix<double, 24, 23> cov = Eigen::Matrix<double, 24, 23>::Zero();
+    // 第0行，第12列的3X3子块置0
     cov.template block<3, 3>(0, 12) = Eigen::Matrix3d::Identity();
+    // acc-ba
     vect3 acc_;
     in.acc.boxminus(acc_, s.ba);
+    // omega-bg
     vect3 omega;
     in.gyro.boxminus(omega, s.bg);
+    // 速度[12]对姿态[3]求导 (标号见上方顺序)
     cov.template block<3, 3>(12, 3) = -s.rot.toRotationMatrix() * MTK::hat(acc_);
+    // 速度对ba求导
     cov.template block<3, 3>(12, 18) = -s.rot.toRotationMatrix();
     Eigen::Matrix<state_ikfom::scalar, 2, 1> vec = Eigen::Matrix<state_ikfom::scalar, 2, 1>::Zero();
     Eigen::Matrix<state_ikfom::scalar, 3, 2> grav_matrix;

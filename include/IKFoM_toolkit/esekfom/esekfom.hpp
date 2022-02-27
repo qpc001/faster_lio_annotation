@@ -1522,12 +1522,20 @@ class esekf {
         }
     }
 
+    // 用了这个
     // iterated error state EKF update modified for one specific system.
+    /**
+     *
+     * @param R 激光测量噪声
+     * @param solve_time 求解时间
+     */
     void update_iterated_dyn_share_modified(double R, double &solve_time) {
+        // 初始化一个dyn_share_datastruct
         dyn_share_datastruct<scalar_type> dyn_share;
         dyn_share.valid = true;
         dyn_share.converge = true;
         int t = 0;
+        // 此处的x_和P_是已经经过IMU前向传播的状态和协方差
         state x_propagated = x_;
         cov P_propagated = P_;
         int dof_Measurement;
@@ -1535,9 +1543,12 @@ class esekf {
         Matrix<scalar_type, n, 1> K_h;
         Matrix<scalar_type, n, n> K_x;
 
+        // 向量化的状态?
         vectorized_state dx_new = vectorized_state::Zero();
+        // 这里进入迭代循环
         for (int i = -1; i < maximum_iter; i++) {
             dyn_share.valid = true;
+            // 执行初始化时(即执行init_dyn_share时)传进来的函数，在这个项目中，传进来的是LaserMapping::ObsModel
             h_dyn_share(x_, dyn_share);
 
             if (!dyn_share.valid) {
@@ -1553,6 +1564,7 @@ class esekf {
             // double solve_start = omp_get_wtime();
             dof_Measurement = h_x_.rows();
             vectorized_state dx;
+            // dx = x_.boxminus(x_propagated)
             x_.boxminus(dx, x_propagated);
             dx_new = dx;
 
@@ -1560,13 +1572,16 @@ class esekf {
 
             Matrix<scalar_type, 3, 3> res_temp_SO3;
             MTK::vect<3, scalar_type> seg_SO3;
+            // 遍历状态的SO3状态(姿态、外参)
             for (std::vector<std::pair<int, int>>::iterator it = x_.SO3_state.begin(); it != x_.SO3_state.end(); it++) {
                 int idx = (*it).first;
                 int dim = (*it).second;
                 for (int i = 0; i < 3; i++) {
+                    // 从 dx 中取对应的值，填充到seg_SO3
                     seg_SO3(i) = dx(idx + i);
                 }
 
+                // MTK::A_matrix: 计算矩阵A(u), 公式参见 FAST-LIO1 公式(6)
                 res_temp_SO3 = MTK::A_matrix(seg_SO3).transpose();
                 dx_new.template block<3, 1>(idx, 0) = res_temp_SO3 * dx_new.template block<3, 1>(idx, 0);
                 for (int i = 0; i < n; i++) {
@@ -1638,6 +1653,7 @@ class esekf {
                 h_x_cur.col(11) = h_x_.col(11);
                 */
 
+                // 如果观测数量比较少，那么直接用标准卡尔曼计算
                 Matrix<scalar_type, Eigen::Dynamic, Eigen::Dynamic> K_ =
                     P_ * h_x_cur.transpose() *
                     (h_x_cur * P_ * h_x_cur.transpose() / R +
@@ -1682,8 +1698,17 @@ class esekf {
                 K_ = P_temp.inverse() * h_x.transpose() * R_in;
                 */
 #else
+                // R是激光测量噪声，
                 cov P_temp = (P_ / R).inverse();
                 // Eigen::Matrix<scalar_type, 12, Eigen::Dynamic> h_T = h_x_.transpose();
+
+                // FAST-LIO1论文公式(20)： K = （ H^{T}R^{-1}H + P^{-1} )^{-1}*H^{T}R^{-1}
+                // 由于 H^{T}R^{-1}H 和 P^{-1}都是对称的， 并且 R是对角矩阵
+                // 所以这里的操作相当于把 R 直接放到里面
+                // 得到: (H^{T}R^{-1}H)^{-1} R^{-1} = H^{T}H = HTH
+                //      P^{-1} R^{-1} = P_temp
+                // 所以，后面的K计算方式为: K =（ H^{T}H + P^{-1}R^{-1} )^{-1} *H^{T}
+                //                        = ( HTH + P_temp)^{-1}*H^{T}
                 Eigen::Matrix<scalar_type, 12, 12> HTH = h_x_.transpose() * h_x_;
                 P_temp.template block<12, 12>(0, 0) += HTH;
                 /*
@@ -1705,10 +1730,19 @@ class esekf {
                 */
                 cov P_inv = P_temp.inverse();
                 // std::cout << "line 1781" << std::endl;
+
+                // K_h: 相当于FAST-LIO1论文公式(18)的 [-Kz]
+                // dyn_share.h: 残差(观测z，因为之前已经加了负号，所以这里不用加)
+                // K = P_inv.template block<n, 12>(0, 0) * HT
+                //   = P_inv.template block<n, 12>(0, 0) * h_x_.transpose()
                 K_h = P_inv.template block<n, 12>(0, 0) * h_x_.transpose() * dyn_share.h;
+
                 // std::cout << "line 1780" << std::endl;
                 // cov_ HTH_cur = cov_::Zero();
                 // HTH_cur. template block<12, 12>(0, 0) = HTH;
+
+                // K_x: 相当于FAST-LIO1论文公式(18)的 [KH]
+                // 所以 K = P_inv.template block<n, 12>(0, 0) * HT
                 K_x.setZero();  // = cov_::Zero();
                 K_x.template block<n, 12>(0, 0) = P_inv.template block<n, 12>(0, 0) * HTH;
                 // K_= (h_x_.transpose() * h_x_ + (P_/R).inverse()).inverse()*h_x_.transpose();
@@ -1716,6 +1750,10 @@ class esekf {
             }
 
             // K_x = K_ * h_x_;
+            // dx_: 更新后的误差状态量
+            // K_h: 相当于FAST-LIO1论文公式(18)的 [-Kz]
+            // K_x: 相当于FAST-LIO1论文公式(18)的 [KH]
+            // dx_new: 这里的dx_new相当于FAST-LIO1论文公式(18)的 [J^{-1}(x_iter - x_proga)]
             Matrix<scalar_type, n, 1> dx_ = K_h + (K_x - Matrix<scalar_type, n, n>::Identity()) * dx_new;
             state x_before = x_;
             x_.boxplus(dx_);
@@ -1871,7 +1909,7 @@ class esekf {
     measurementMatrix2_dyn *h_v_dyn;
 
     measurementModel_share *h_share;
-    measurementModel_dyn_share h_dyn_share;
+    measurementModel_dyn_share h_dyn_share; ///< 这里传进来了 LaserMapping::ObsModel 函数
 
     int maximum_iter = 0;
     scalar_type limit[n];

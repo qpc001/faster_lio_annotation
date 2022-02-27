@@ -13,6 +13,7 @@ set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS}")
 
 add_definitions(-DROOT_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/\")
 add_subdirectory(thirdparty/livox_ros_driver)
+SET(CUSTOM_TBB_DIR "/home/msi/shared_dir/slam_ws/src/faster-lio/thirdparty/tbb2018_20170726oss")
 
 include(cmake/packages.cmake)
 
