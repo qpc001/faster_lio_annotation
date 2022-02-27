@@ -223,7 +223,7 @@ void ImuProcess::UndistortPcl(const common::MeasureGroup &meas, esekfom::esekf<s
 
         // 如果前面的IMU时间 < 上一次去畸变的激光扫描结束时刻(即当前帧扫描起始时间)
         if (head->header.stamp.toSec() < last_lidar_end_time_) {
-            // 通常，这里只有第一帧IMU数据才会进来，即(last_imu_)这个数据
+            // 通常，每次去畸变的时候，只有第一帧IMU数据都会进来，即(last_imu_)这个数据
             // 需要积分的时间段为[last_lidar_end_time_, tail->header.stamp.toSec()]
             dt = tail->header.stamp.toSec() - last_lidar_end_time_;
         } else {
